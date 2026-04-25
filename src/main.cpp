@@ -56,16 +56,16 @@ constexpr int16_t PWM_LIMIT             = 255;
 constexpr double  MAX_VX_CMD_MM_S       = 300.0;
 constexpr double  MAX_VY_CMD_MM_S       = 300.0; // 追加
 constexpr double  NEAR_SPEED_LIMIT_MM_S = 80.0;
-constexpr double  POSITION_DEADBAND_MM  = 1.0;
+constexpr double  POSITION_DEADBAND_MM  = 3.0; // 1.0 -> 3.0
 constexpr double  SPEED_DEADBAND_MM_S   = 2.0;
 constexpr double  MAX_OMEGA_CMD_RAD_S   = 2.0;  // 追加: 角速度上限[rad/s]
-constexpr double  THETA_DEADBAND_RAD    = 0.03; // 追加: 約1.7deg
+constexpr double  THETA_DEADBAND_RAD    = 0.08; // 0.03 -> 0.08
+constexpr int     PWM_DEADBAND          = 8;
 constexpr double  DEG2RAD               = PI / 180.0;
 
 const double RAD2DEG = 360 / (2 * PI);
 
-constexpr double USER_SIGN = -1.0; // fを前進にしたい場合 -1.0（現状の逆転補正）
-
+constexpr double USER_SIGN                = -1.0;
 volatile int16_t rx_target_x_mm_i16       = 0;
 volatile int16_t rx_target_y_mm_i16       = 0;
 volatile int16_t rx_target_theta_mrad_i16 = 0;
@@ -75,9 +75,9 @@ PositionPid position_pid_x(1.5, 0.0, 0.01, -MAX_VX_CMD_MM_S, MAX_VX_CMD_MM_S, -I
 PositionPid position_pid_y(1.5, 0.0, 0.01, -MAX_VY_CMD_MM_S, MAX_VY_CMD_MM_S, -INTEGRAL_MAX, INTEGRAL_MAX);
 PositionPid position_pid_theta(2.0, 0.0, 0.01, -MAX_OMEGA_CMD_RAD_S, MAX_OMEGA_CMD_RAD_S, -INTEGRAL_MAX, INTEGRAL_MAX);
 
-SpeedPID speed_pid_1(1.5, 12., 0.00, -PWM_LIMIT, PWM_LIMIT);
-SpeedPID speed_pid_2(1.5, 12., 0.00, -PWM_LIMIT, PWM_LIMIT);
-SpeedPID speed_pid_3(1.5, 12., 0.00, -PWM_LIMIT, PWM_LIMIT);
+SpeedPID speed_pid_1(3., 7., 0.00, -PWM_LIMIT, PWM_LIMIT);
+SpeedPID speed_pid_2(3., 7., 0.00, -PWM_LIMIT, PWM_LIMIT);
+SpeedPID speed_pid_3(3., 7., 0.00, -PWM_LIMIT, PWM_LIMIT);
 
 constexpr int8_t ENCODER_SIGN_1 = -1;
 constexpr int8_t ENCODER_SIGN_2 = -1;
@@ -117,15 +117,13 @@ void countsToBodyDelta(long dc1, long dc2, long dc3, double& dx, double& dy, dou
 
 // signは、モータの配線や取り付け向きの補正
 void setMotor(int8_t dirPin, int pwmCh, int sign, int pwm_signed) {
-    bool is_dir = HIGH;
-    int  duty   = sign * pwm_signed;
-    if (duty > 0) {
-        is_dir = HIGH;
-    } else {
-        is_dir = LOW;
+    int duty = sign * pwm_signed;
+    if (abs(duty) < PWM_DEADBAND) {
+        ledcWrite(pwmCh, 0);
+        return; // 0付近はDIRを触らない
     }
-    digitalWrite(dirPin, is_dir);
-    ledcWrite(pwmCh, abs(duty)); // pwmCh は LEDC channel (PWM_CH_1 など)
+    digitalWrite(dirPin, (duty > 0) ? HIGH : LOW);
+    ledcWrite(pwmCh, abs(duty));
 }
 static inline double clampd(double v, double lo, double hi) {
     if (v < lo) return lo;
@@ -155,16 +153,10 @@ void OnDataRecv(const uint8_t* mac_addr, const uint8_t* data, int data_len) {
     const int16_t rx_y          = (int16_t)((data[2] << 8) | data[3]);
     const int16_t rx_theta_mrad = (int16_t)((data[4] << 8) | data[5]);
 
-    // callback内では生値だけ保持
     rx_target_x_mm_i16       = rx_x;
     rx_target_y_mm_i16       = rx_y;
     rx_target_theta_mrad_i16 = rx_theta_mrad;
     rx_new_target            = true;
-
-    target_x_mm  = (double)rx_x;
-    target_y_mm  = (double)rx_y;
-    target_theta = (double)rx_theta_mrad / 1000.0; // mrad -> rad
-    moving       = true;
 }
 
 void setup() {
@@ -369,13 +361,19 @@ void loop() {
     setMotor(PIN_DIR_2, W2_CH, W2_SIGN, lround(pwm2));
     setMotor(PIN_DIR_3, W3_CH, W3_SIGN, lround(pwm3));
 
-    int16_t send_x_mm       = (int16_t)lround(x_mm);
-    int16_t send_y_mm       = (int16_t)lround(y_mm);
+    int16_t send_x_mm       = (int16_t)lround(x_mm * USER_SIGN);
+    int16_t send_y_mm       = (int16_t)lround(y_mm * USER_SIGN);
     int16_t send_theta_mrad = (int16_t)lround(theta * 1000.0);
 
-    uint8_t data[6] = {(uint8_t)((send_x_mm >> 8) & 0xFF),       (uint8_t)(send_x_mm & 0xFF),
-                       (uint8_t)((send_y_mm >> 8) & 0xFF),       (uint8_t)(send_y_mm & 0xFF),
-                       (uint8_t)((send_theta_mrad >> 8) & 0xFF), (uint8_t)(send_theta_mrad & 0xFF)};
+    uint8_t data[9] = {(uint8_t)((send_x_mm >> 8) & 0xFF),
+                       (uint8_t)(send_x_mm & 0xFF),
+                       (uint8_t)((send_y_mm >> 8) & 0xFF),
+                       (uint8_t)(send_y_mm & 0xFF),
+                       (uint8_t)((send_theta_mrad >> 8) & 0xFF),
+                       (uint8_t)(send_theta_mrad & 0xFF),
+                       (uint8_t)(pwm1),
+                       (uint8_t)(pwm2),
+                       (uint8_t)(pwm3)};
 
     esp_err_t result = esp_now_send(slave.peer_addr, data, sizeof(data));
 
